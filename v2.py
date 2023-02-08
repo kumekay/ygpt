@@ -8,14 +8,17 @@ from torch.nn import functional as fn
 torch.manual_seed(1337)
 text_path = Path("./input.txt")
 
-block_size = 8
-batch_size = 32
-eval_iters = 200
+block_size = 256
+batch_size = 64
+eval_iters = 100
 eval_interval = 500
 max_iters = 5000
-n_embed = 32
-device = "cpu"  # torch.device("cuda" if torch.cuda.is_available() else "cpu")
-learning_rate = 1e-3
+n_embed = 384
+n_blocks = 6
+n_heads = 6
+dropout = 0.2
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+learning_rate = 3e-4
 
 text = text_path.read_text()
 voc = sorted(set(text))
@@ -57,6 +60,7 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embed, head_size, bias=False)
         self.value = nn.Linear(n_embed, head_size, bias=False)
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -67,6 +71,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-1, -2) / (C**0.5)  # (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
         wei = fn.softmax(wei, dim=-1)  # (B, T, T)
+        wei = self.dropout(wei)
 
         return wei @ v  # (B, T, head_size)
 
@@ -75,20 +80,45 @@ class MultiheadAttention(nn.Module):
     def __init__(self, head_size, n_heads):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(n_heads)])
+        self.proj = nn.Linear(n_embed, n_embed)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        return torch.cat(
+        out = torch.cat(
             [h(x) for h in self.heads], dim=-1
         )  # (B, T, head_size * n_heads)
+        out = self.proj(out)  # (B, T, n_embed)
+        out = self.dropout(out)
+        return out
 
 
 class Feedforward(nn.Module):
     def __init__(self, n_embed):
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(n_embed, n_embed), nn.ReLU())
+        self.net = nn.Sequential(
+            nn.Linear(n_embed, 4 * n_embed),
+            nn.ReLU(),
+            nn.Linear(4 * n_embed, n_embed),
+            nn.Dropout(dropout),
+        )
 
     def forward(self, x):
         return self.net(x)
+
+
+class Block(nn.Module):
+    def __init__(self, n_embed, n_heads):
+        super().__init__()
+        head_size = n_embed // n_heads
+        self.sa_head = MultiheadAttention(n_heads, head_size)
+        self.ff = Feedforward(n_embed)
+        self.ln1 = nn.LayerNorm(n_embed)
+        self.ln2 = nn.LayerNorm(n_embed)
+
+    def forward(self, x):
+        x = x + self.sa_head(self.ln1(x))  # (B, T, n_embed)
+        x = x + self.ff(self.ln2(x))  # (B, T, n_embed)
+        return x
 
 
 class BigramLanguageModel(nn.Module):
@@ -96,8 +126,10 @@ class BigramLanguageModel(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
-        self.sa_head = MultiheadAttention(4, n_embed // 4)
-        self.ff = Feedforward(n_embed)
+        self.blocks = nn.Sequential(
+            *[Block(n_embed, n_heads) for _ in range(n_blocks)],
+            nn.LayerNorm(n_embed),
+        )
         self.lm_head = nn.Linear(n_embed, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -108,8 +140,7 @@ class BigramLanguageModel(nn.Module):
             torch.arange(T, device=device)
         )  # (T, n_embed)
         x = tok_embed + pos_embed  # (B, T, n_embed)
-        x = self.sa_head(x)  # (B, T, n_embed)
-        x = self.ff(x)  # (B, T, n_embed)
+        x = self.blocks(x)  # (B, T, n_embed)
         logits = self.lm_head(x)  # (B, T, vocab_size)
 
         if targets is None:
@@ -161,11 +192,13 @@ for step in range(max_iters):
     loss.backward()
     optimizer.step()
 
-    if step % eval_interval == 0:
+    print(".", end="" if step % 100 != 0 else "\n", flush=True)
+
+    if step % eval_interval == 0 or step == max_iters - 1:
         out = estimate_loss()
         print(
             f"step {step}: train_loss={out['train_loss']:.4f}, val_loss={out['val_loss']:.4f}"
         )
 
 
-print(decode(m.generate(torch.tensor([[0]]).to(device)).tolist()[0]))
+print(decode(m.generate(torch.tensor([[0]]).to(device), 1000).tolist()[0]))
